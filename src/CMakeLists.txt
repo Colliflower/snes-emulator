@@ -2,7 +2,7 @@ set(src_files emulator.cpp)
 add_executable(myemulator ${src_files})
 
 set(warnings $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Werror>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion>
 )
 
 target_include_directories(myemulator PUBLIC ${PROJECT_SOURCE_DIR}/include)

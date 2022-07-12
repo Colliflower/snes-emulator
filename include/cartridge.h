@@ -13,6 +13,27 @@
 
 namespace trv::snes
 {
+typedef uint16_t Address;
+
+enum class Interrupt
+{
+	COP,
+	BRK,
+	ABORT,
+	NMI,
+	IRQ,
+	RES,
+	Count
+};
+
+enum class ROMType : uint8_t
+{
+	LoROM,
+	HiROM,
+	ExLoROM,
+	ExHiROM,
+};
+
 enum class CartridgeType : uint8_t
 {
 	ROM                 = 0x00,
@@ -38,16 +59,24 @@ struct Header
 {
    public:
 	Header() = default;
-	Header(const std::vector<unsigned char>& cartridge)
+	Header(const std::vector<unsigned char>& cartridge, bool hasSMCHeader)
 	{
-		if (!build(cartridge, 0x7FC0))
+		if (!build(cartridge, hasSMCHeader ? (0x7FC0 + 0x200) : 0x7FC0))
 		{
-			if (!build(cartridge, 0xFFC0))
+			if (!build(cartridge, hasSMCHeader ? (0xFFC0 + 0x200) : 0xFFC0))
 			{
 				throw std::runtime_error(
 				    "TRV::SNES::CARTRIDGE Unable to determine ROM format cartridge may be "
 				    "corrupt.");
 			}
+			else
+			{
+				romType = ROMType::HiROM;
+			}
+		}
+		else
+		{
+			romType = ROMType::LoROM;
 		}
 	};
 
@@ -72,9 +101,18 @@ struct Header
 		cartridgeROMSize = 0x400 << logKBROMSize;
 		cartridgeRAMSize = 0X400 << logKBRAMSize;
 
-		copyInto(country, cartridge, offset);
+		// copyInto(country, cartridge, offset);
 		copyInto(licensee, cartridge, offset);
+		offset += 1;
 		copyInto(version, cartridge, offset);
+		copyInto(nchecksum, cartridge, offset);
+		copyInto(checksum, cartridge, offset);
+
+		if ((nchecksum ^ checksum) != 0xFFFF)
+		{
+			return false;
+		}
+
 		return true;
 	};
 
@@ -83,10 +121,10 @@ struct Header
 		o << "Title: " << header.title.data()
 		  << "\nFastROM: " << (header.fastROM ? "True" : "False")
 		  << "\nMapping Mode: " << header.mappingMode
-		  << "\nCartridge Type: " << static_cast<uint8_t>(header.cartridgeType)
+		  << "\nCartridge Type: " << static_cast<int>(header.cartridgeType)
 		  << "\nROM Size: " << header.cartridgeROMSize << "\nRAM Size: " << header.cartridgeRAMSize
 		  << "\nCountry: " << header.country << "\nLicensee" << header.licensee
-		  << "\nVersion: " << header.version;
+		  << "\nVersion: " << header.version << "\nROM Type: " << static_cast<int>(header.romType);
 		return o;
 	};
 
@@ -124,11 +162,74 @@ struct Header
 	std::uint8_t country;
 	std::uint8_t licensee;
 	std::uint8_t version;
+	std::uint16_t nchecksum;
+	std::uint16_t checksum;
+	ROMType romType;
+};
+
+inline uint16_t get_address(const std::vector<unsigned char>& cartridge, std::size_t address)
+{
+	return (cartridge[address + 1] << 8) + cartridge[address];
+};
+struct NativeInterruptVector
+{
+	NativeInterruptVector() = default;
+	NativeInterruptVector(const std::vector<unsigned char>& cartridge, std::size_t offset) :
+	    addresses {
+		    get_address(cartridge, 0xFE4 + offset),  // COP
+		    get_address(cartridge, 0xFE6 + offset),  // BRK
+		    get_address(cartridge, 0xFE8 + offset),  // ABORT
+		    get_address(cartridge, 0xFEA + offset),  // NMI
+		    get_address(cartridge, 0xFEF + offset)   // IRQ
+	    } {};
+
+	Address dispatchInterrupt(Interrupt interrupt)
+	{
+		if (interrupt == Interrupt::RES || interrupt == Interrupt::Count)
+		{
+			throw std::runtime_error(
+			    "TRV::SNES::CARTRIDGE Unexpected interrupt recieved in native mode.");
+		}
+
+		return addresses[static_cast<std::size_t>(interrupt)];
+	};
+
+   private:
+	std::array<Address, static_cast<std::size_t>(Interrupt::Count)> addresses;
+};
+
+struct EmulatorInterruptVector
+{
+	EmulatorInterruptVector() = default;
+	EmulatorInterruptVector(const std::vector<unsigned char>& cartridge, std::size_t offset) :
+	    addresses {
+		    get_address(cartridge, 0xFF4 + offset),  // COP
+		    get_address(cartridge, 0xFFE + offset),  // BRK
+		    get_address(cartridge, 0xFF8 + offset),  // ABORT
+		    get_address(cartridge, 0xFEA + offset),  // NMI
+		    get_address(cartridge, 0xFFE + offset),  // IRQ
+		    get_address(cartridge, 0xFFC + offset),  // RES
+	    } {};
+
+	Address dispatchInterrupt(Interrupt interrupt)
+	{
+		if (interrupt == Interrupt::Count)
+		{
+			throw std::runtime_error(
+			    "TRV::SNES::CARTRIDGE Unexpected interrupt recieved in native mode.");
+		}
+
+		return addresses[static_cast<std::size_t>(interrupt)];
+	};
+
+   private:
+	std::array<Address, static_cast<std::size_t>(Interrupt::Count)> addresses;
 };
 
 struct Cartridge
 {
 	static constexpr std::size_t MAX_CART_SIZE = 0x6'000'000;
+	static constexpr std::size_t MIN_CART_SIZE = 0x8'000;
 
 	Cartridge() = default;
 
@@ -145,24 +246,59 @@ struct Cartridge
 		infile.ignore(std::numeric_limits<std::streamsize>::max());
 		std::streamsize length = infile.gcount();
 
+		infile.clear();
+		infile.seekg(0, std::ios_base::beg);
+
 		std::cout << "Size: " << length << "\n";
+
+		if (length < MIN_CART_SIZE)
+		{
+			throw std::runtime_error("TRV::SNES::CARTRIDGE File size smaller than expected.");
+		}
 
 		if (length > MAX_CART_SIZE)
 		{
 			throw std::runtime_error("TRV::SNES::CARTRIDGE File size larger than expected.");
 		}
 
-		infile.clear();
-		infile.seekg(0, std::ios_base::beg);
+		std::size_t remainder = length & 0x7FFF;
+
+		bool hasSMCHeader = false;
+
+		if (remainder == 0x200)
+		{
+			hasSMCHeader = true;
+		}
+		else if (remainder != 0)
+		{
+			throw std::runtime_error("TRV::SNES::CARTRIDGE Unexpected ROM size.");
+		}
 
 		data.reserve(length);
 		std::copy(std::istreambuf_iterator<char>(infile), {}, std::back_inserter(data));
 
-		header = Header(data);
+		header = Header(data, hasSMCHeader);
 		std::cout << header;
+
+		std::size_t offset;
+
+		switch (header.romType)
+		{
+			case ROMType::LoROM:
+				offset = 0x7000;
+				break;
+			case ROMType::HiROM:
+				offset = 0xF000;
+				break;
+		}
+
+		nativeInterrupts   = NativeInterruptVector(data, offset);
+		emulatorInterrupts = EmulatorInterruptVector(data, offset);
 	};
 
 	Header header;
+	NativeInterruptVector nativeInterrupts;
+	EmulatorInterruptVector emulatorInterrupts;
 	std::vector<unsigned char> data;
 };
 }
